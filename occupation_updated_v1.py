@@ -144,15 +144,102 @@ def recognize_seat_owner(frame, box, front_shift=150, back_shift=[40, 140]): # f
 		seat_owner = (4, "Back right")
 	else:
 		seat_owner = (None, "Not passenger")
+	print('seat_owner')
 	return seat_owner
-print('seat_owner')
+
+
+
+def export_onnx(model, img, file, opset, train, dynamic, simplify, output_names=None):
+    # ONNX model export
+    prefix = colorstr('ONNX:')
+    try:
+        check_requirements(('onnx', 'onnx-simplifier'))
+        import onnx
+
+        print(f'\n{prefix} starting export with onnx {onnx.__version__}...')
+        f = file.with_suffix('.onnx')
+        torch.onnx.export(model, img, f, verbose=False, opset_version=opset,
+                          training=torch.onnx.TrainingMode.TRAINING if train else torch.onnx.TrainingMode.EVAL,
+                          do_constant_folding=not train,
+                          input_names=['images'],
+                          output_names=['output'] if output_names is None else output_names,
+                          dynamic_axes={'images': {0: 'batch', 2: 'height', 3: 'width'},  # shape(1,3,640,640)
+                                        'output': {0: 'batch', 1: 'anchors'}  # shape(1,25200,85)
+                                        } if dynamic else None)
+
+        # Checks
+        model_onnx = onnx.load(f)  # load onnx model
+        onnx.checker.check_model(model_onnx)  # check onnx model
+        # print(onnx.helper.printable_graph(model_onnx.graph))  # print
+
+        # Simplify
+        if simplify:
+            try:
+                import onnxsim
+
+                print(f'{prefix} simplifying with onnx-simplifier {onnxsim.__version__}...')
+                model_onnx, check = onnxsim.simplify(
+                    model_onnx,
+                    dynamic_input_shape=dynamic,
+                    input_shapes={'images': list(img.shape)} if dynamic else None)
+                assert check, 'assert check failed'
+                onnx.save(model_onnx, f)
+            except Exception as e:
+                print(f'{prefix} simplifier failure: {e}')
+        print(f'{prefix} export success, saved as {f} ({file_size(f):.1f} MB)')
+        print(f"{prefix} run --dynamic ONNX model inference with detect.py: 'python detect.py --weights {f}'")
+    except Exception as e:
+        print(f'{prefix} export failure: {e}')
+
+
+def export_prototxt(model, img, file, simple_search):
+    # Prototxt export for a given ONNX model
+    prefix = colorstr('Prototxt:')
+    onnx_model_name = str(file.with_suffix('.onnx'))
+
+    for module in model.modules():
+        if isinstance(module, Detect):
+            anchor_grid = torch.squeeze(module.anchor_grid)
+            break
+    num_heads = anchor_grid.shape[0]
+    matched_names = retrieve_onnx_names(img, model, onnx_model_name, simple_search=simple_search)
+    prototxt_name = onnx_model_name.replace('onnx', 'prototxt')
+
+    background_label_id = -1
+    num_classes = model.nc
+    assert len(matched_names) == num_heads; "There must be a matched name for each head"
+    proto_names = [f'{matched_names[i]}' for i in range(num_heads)]
+    yolo_params = []
+    for head_id in range(num_heads):
+        yolo_param = tidl_meta_arch_yolov5_pb2.TIDLYoloParams(input=proto_names[head_id],
+                                                        anchor_width=anchor_grid[head_id,:,0],
+                                                        anchor_height=anchor_grid[head_id,:,1])
+        yolo_params.append(yolo_param)
+
+    nms_param = tidl_meta_arch_yolov5_pb2.TIDLNmsParam(nms_threshold=0.65, top_k=30000)
+    detection_output_param = tidl_meta_arch_yolov5_pb2.TIDLOdPostProc(num_classes=num_classes, share_location=True,
+                                            background_label_id=background_label_id, nms_param=nms_param,
+                                            code_type=tidl_meta_arch_yolov5_pb2.CODE_TYPE_YOLO_V5, keep_top_k=300,
+                                            confidence_threshold=0.005)
+
+    yolov3 = tidl_meta_arch_yolov5_pb2.TidlYoloOd(name='yolo_v3', output=["detections"],
+                                            in_width=img.shape[3], in_height=img.shape[2],
+                                            yolo_param=yolo_params,
+                                            detection_output_param=detection_output_param,
+                                            )
+    arch = tidl_meta_arch_yolov5_pb2.TIDLMetaArch(name='yolo_v3', tidl_yolo=[yolov3])
+
+    with open(prototxt_name, 'wt') as pfile:
+        txt_message = text_format.MessageToString(arch)
+        pfile.write(txt_message)
+
 
 
 if __name__ == '__main__':
-	cap = cv2.VideoCapture("/home/shiraz/Downloads/4shiraz/2023-01-12-135839.webm")
+	cap = cv2.VideoCapture("./test.jpg")
 	#cap = cv2.VideoCapture(0)
-	cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-	cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+	# cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+	# cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
  
 	prev_frame_time = 0
 	new_frame_time = 0
